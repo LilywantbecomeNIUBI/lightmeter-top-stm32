@@ -1,0 +1,677 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Camera light meter top main program
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "adc.h"
+#include "i2c.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* USER CODE BEGIN Includes */
+#include "ssd1306_i2c.h"
+#include "veml7700.h"
+#include <stdio.h>
+#include <stdint.h>
+/* USER CODE END Includes */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+
+/* USER CODE BEGIN PD */
+#define ARRAY_LEN(a)              (sizeof(a) / sizeof((a)[0]))
+#define ENCODER_STEP              4
+#define KEY_PRESSED               GPIO_PIN_RESET
+#define KEY_RELEASED              GPIO_PIN_SET
+#define KEY_DEBOUNCE_MS           35U
+#define SENSOR_PERIOD_MS          400U
+#define UI_PERIOD_MS              180U
+/* USER CODE END PD */
+
+/* USER CODE BEGIN PTD */
+typedef enum {
+  MODE_TV = 0,   /* shutter priority */
+  MODE_AV = 1    /* aperture priority */
+} MeterMode;
+
+typedef enum {
+  METER_OK = 0,
+  METER_UNDER,
+  METER_OVER,
+  METER_SENSOR_ERR
+} MeterHint;
+
+typedef struct {
+  GPIO_TypeDef *port;
+  uint16_t pin;
+  GPIO_PinState stable;
+  GPIO_PinState last_read;
+  uint32_t last_change_ms;
+} ButtonState;
+/* USER CODE END PTD */
+
+/* USER CODE BEGIN PV */
+static VEML7700_HandleTypeDef hveml;
+static ButtonState btn_mode;
+static ButtonState btn_iso;
+
+static const uint16_t shutter_den_tbl[] = {1, 2, 4, 8, 15, 30, 60, 125, 250, 500};
+static const uint16_t aperture_x10_tbl[] = {35, 40, 47, 56, 80, 110, 160, 220, 320, 450};
+static const uint16_t iso_tbl[] = {100, 125, 160, 200, 400};
+
+static MeterMode g_mode = MODE_TV;
+static MeterHint g_hint = METER_SENSOR_ERR;
+static uint8_t g_shutter_idx = 6;   /* 1/60 */
+static uint8_t g_aperture_idx = 3;  /* f/5.6 */
+static uint8_t g_iso_idx = 0;
+static uint32_t g_lux_x10 = 0;
+static int16_t g_ev_x10 = 0;
+static uint16_t g_bat_mv = 0;
+static uint8_t g_bat_pct = 0;
+static uint8_t g_sensor_ok = 0;
+static int16_t enc_last = 0;
+/* USER CODE END PV */
+
+/* USER CODE BEGIN PFP */
+static void App_Init(void);
+static void App_Task(void);
+static void Process_Input(void);
+static void Update_Meter(void);
+static void Meter_Recalculate(void);
+static int8_t Encoder_ReadDetents(void);
+static uint8_t Button_Fell(ButtonState *btn);
+static uint16_t Battery_ReadMv(void);
+static uint8_t Battery_Percent(uint16_t mv);
+static uint8_t FindNearestShutter(float target_s);
+static uint8_t FindNearestApertureByN2(float target_n2);
+static int16_t EV10_FromLuxIso(uint32_t lux_x10, uint16_t iso);
+static void Update_Display(void);
+/* USER CODE END PFP */
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_I2C1_Init();
+  MX_TIM2_Init();
+  MX_USART1_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  App_Init();
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    /* USER CODE BEGIN WHILE */
+    App_Task();
+    /* USER CODE END WHILE */
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV2;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+static void App_Init(void)
+{
+  btn_mode.port = GPIOB;
+  btn_mode.pin = GPIO_PIN_0;
+  btn_mode.stable = KEY_RELEASED;
+  btn_mode.last_read = KEY_RELEASED;
+  btn_mode.last_change_ms = HAL_GetTick();
+
+  btn_iso.port = GPIOB;
+  btn_iso.pin = GPIO_PIN_1;
+  btn_iso.stable = KEY_RELEASED;
+  btn_iso.last_read = KEY_RELEASED;
+  btn_iso.last_change_ms = HAL_GetTick();
+
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+  enc_last = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  HAL_ADC_Start(&hadc1);
+
+  if (SSD1306_Init(&hi2c1) == HAL_OK) {
+    SSD1306_Clear();
+    SSD1306_DrawString(0, 0, "Light Meter Top");
+    SSD1306_DrawString(0, 2, "Init VEML7700...");
+    SSD1306_Update();
+  }
+
+  if (VEML7700_Init(&hveml, &hi2c1) != HAL_OK) {
+    g_sensor_ok = 0;
+    g_hint = METER_SENSOR_ERR;
+  } else {
+    g_sensor_ok = 1;
+    g_hint = METER_OK;
+  }
+
+  HAL_Delay(150);
+  Update_Meter();
+  Update_Display();
+}
+
+static void App_Task(void)
+{
+  static uint32_t last_sensor_ms = 0;
+  static uint32_t last_ui_ms = 0;
+  uint32_t now = HAL_GetTick();
+
+  Process_Input();
+
+  if ((now - last_sensor_ms) >= SENSOR_PERIOD_MS) {
+    last_sensor_ms = now;
+    Update_Meter();
+  }
+
+  if ((now - last_ui_ms) >= UI_PERIOD_MS) {
+    last_ui_ms = now;
+    Update_Display();
+  }
+}
+
+static void Process_Input(void)
+{
+  int8_t detents = Encoder_ReadDetents();
+
+  if (detents != 0) {
+    if (g_mode == MODE_TV) {
+      int16_t idx = (int16_t)g_shutter_idx + detents;
+      if (idx < 0) idx = 0;
+      if (idx >= (int16_t)ARRAY_LEN(shutter_den_tbl)) idx = (int16_t)ARRAY_LEN(shutter_den_tbl) - 1;
+      g_shutter_idx = (uint8_t)idx;
+    } else {
+      int16_t idx = (int16_t)g_aperture_idx + detents;
+      if (idx < 0) idx = 0;
+      if (idx >= (int16_t)ARRAY_LEN(aperture_x10_tbl)) idx = (int16_t)ARRAY_LEN(aperture_x10_tbl) - 1;
+      g_aperture_idx = (uint8_t)idx;
+    }
+    Meter_Recalculate();
+    Update_Display();
+  }
+
+  if (Button_Fell(&btn_mode)) {
+    g_mode = (g_mode == MODE_TV) ? MODE_AV : MODE_TV;
+    Meter_Recalculate();
+    Update_Display();
+  }
+
+  if (Button_Fell(&btn_iso)) {
+    g_iso_idx++;
+    if (g_iso_idx >= ARRAY_LEN(iso_tbl)) g_iso_idx = 0;
+    Meter_Recalculate();
+    Update_Display();
+  }
+}
+
+static void Update_Meter(void)
+{
+  uint32_t lux_x10;
+  if (VEML7700_ReadLuxAutoX10(&hveml, &lux_x10) == HAL_OK) {
+    g_lux_x10 = lux_x10;
+    g_sensor_ok = 1;
+  } else {
+    g_sensor_ok = 0;
+    g_hint = METER_SENSOR_ERR;
+  }
+
+  g_bat_mv = Battery_ReadMv();
+  g_bat_pct = Battery_Percent(g_bat_mv);
+  Meter_Recalculate();
+}
+
+static void Meter_Recalculate(void)
+{
+  uint16_t iso = iso_tbl[g_iso_idx];
+  float lux = (float)g_lux_x10 / 10.0f;
+  float light_power;
+
+  g_ev_x10 = EV10_FromLuxIso(g_lux_x10, iso);
+
+  if (g_sensor_ok == 0U) {
+    g_hint = METER_SENSOR_ERR;
+    return;
+  }
+  if (g_lux_x10 == 0U) {
+    g_hint = METER_UNDER;
+    return;
+  }
+
+  /* Incident meter approximation: EV100 = log2(lux / 2.5).
+     Therefore N^2 / t = lux * ISO / 250. */
+  light_power = lux * ((float)iso / 250.0f);
+
+  if (g_mode == MODE_AV) {
+    float n = (float)aperture_x10_tbl[g_aperture_idx] / 10.0f;
+    float target_s = (n * n) / light_power;
+
+    if (target_s > (1.0f / (float)shutter_den_tbl[0])) {
+      g_hint = METER_UNDER;
+    } else if (target_s < (1.0f / (float)shutter_den_tbl[ARRAY_LEN(shutter_den_tbl) - 1])) {
+      g_hint = METER_OVER;
+    } else {
+      g_hint = METER_OK;
+    }
+    g_shutter_idx = FindNearestShutter(target_s);
+  } else {
+    float t = 1.0f / (float)shutter_den_tbl[g_shutter_idx];
+    float target_n2 = t * light_power;
+    float min_n = (float)aperture_x10_tbl[0] / 10.0f;
+    float max_n = (float)aperture_x10_tbl[ARRAY_LEN(aperture_x10_tbl) - 1] / 10.0f;
+
+    if (target_n2 < (min_n * min_n)) {
+      g_hint = METER_UNDER;
+    } else if (target_n2 > (max_n * max_n)) {
+      g_hint = METER_OVER;
+    } else {
+      g_hint = METER_OK;
+    }
+    g_aperture_idx = FindNearestApertureByN2(target_n2);
+  }
+}
+
+static int8_t Encoder_ReadDetents(void)
+{
+  int16_t now = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  int16_t diff = (int16_t)(now - enc_last);
+  int8_t detents = 0;
+
+  if (diff >= ENCODER_STEP) {
+    detents = (int8_t)(diff / ENCODER_STEP);
+    enc_last = (int16_t)(enc_last + detents * ENCODER_STEP);
+  } else if (diff <= -ENCODER_STEP) {
+    detents = (int8_t)(diff / ENCODER_STEP);
+    enc_last = (int16_t)(enc_last + detents * ENCODER_STEP);
+  }
+  return detents;
+}
+
+static uint8_t Button_Fell(ButtonState *btn)
+{
+  GPIO_PinState read = HAL_GPIO_ReadPin(btn->port, btn->pin);
+  uint32_t now = HAL_GetTick();
+
+  if (read != btn->last_read) {
+    btn->last_read = read;
+    btn->last_change_ms = now;
+  }
+
+  if ((now - btn->last_change_ms) >= KEY_DEBOUNCE_MS) {
+    if (read != btn->stable) {
+      btn->stable = read;
+      if (btn->stable == KEY_PRESSED) {
+        return 1U;
+      }
+    }
+  }
+  return 0U;
+}
+
+static uint16_t Battery_ReadMv(void)
+{
+  uint32_t raw = 0;
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+    raw = HAL_ADC_GetValue(&hadc1);
+  }
+  /* ADC reference 3.3V, 12-bit ADC, external divider is 1:2, so multiply by 2. */
+  return (uint16_t)((raw * 3300UL * 2UL) / 4095UL);
+}
+
+static uint8_t Battery_Percent(uint16_t mv)
+{
+  if (mv <= 3200U) return 0U;
+  if (mv >= 4200U) return 100U;
+  return (uint8_t)(((uint32_t)(mv - 3200U) * 100UL) / 1000UL);
+}
+
+static uint8_t FindNearestShutter(float target_s)
+{
+  uint8_t best = 0;
+  float best_score = 100000000.0f;
+  for (uint8_t i = 0; i < ARRAY_LEN(shutter_den_tbl); i++) {
+    float s = 1.0f / (float)shutter_den_tbl[i];
+    float score = (s > target_s) ? (s / target_s) : (target_s / s);
+    if (score < best_score) {
+      best_score = score;
+      best = i;
+    }
+  }
+  return best;
+}
+
+static uint8_t FindNearestApertureByN2(float target_n2)
+{
+  uint8_t best = 0;
+  float best_score = 100000000.0f;
+  for (uint8_t i = 0; i < ARRAY_LEN(aperture_x10_tbl); i++) {
+    float n = (float)aperture_x10_tbl[i] / 10.0f;
+    float n2 = n * n;
+    float score = (n2 > target_n2) ? (n2 / target_n2) : (target_n2 / n2);
+    if (score < best_score) {
+      best_score = score;
+      best = i;
+    }
+  }
+  return best;
+}
+
+static int16_t EV10_FromLuxIso(uint32_t lux_x10, uint16_t iso)
+{
+  float v;
+  int16_t ev = 0;
+  if (lux_x10 == 0U || iso == 0U) return -990;
+
+  /* v = N^2/t = lux * ISO / 250.  lux_x10 is lux * 10. */
+  v = ((float)lux_x10 * (float)iso) / 2500.0f;
+  while (v >= 2.0f) { v *= 0.5f; ev += 10; }
+  while (v < 1.0f)  { v *= 2.0f; ev -= 10; }
+
+  /* Small approximation of 10*log2(v), v in [1, 2). Enough for UI display. */
+  ev += (int16_t)((v - 1.0f) * 10.0f + 0.5f);
+  return ev;
+}
+
+static void UI_FillRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
+{
+  for (uint8_t yy = 0; yy < h; yy++) {
+    for (uint8_t xx = 0; xx < w; xx++) {
+      SSD1306_DrawPixel((uint8_t)(x + xx), (uint8_t)(y + yy), 1U);
+    }
+  }
+}
+
+static const char *UI_BigPattern(char c)
+{
+  switch (c) {
+    case '0': return "111"
+                     "101"
+                     "101"
+                     "101"
+                     "111";
+    case '1': return "010"
+                     "110"
+                     "010"
+                     "010"
+                     "111";
+    case '2': return "111"
+                     "001"
+                     "111"
+                     "100"
+                     "111";
+    case '3': return "111"
+                     "001"
+                     "111"
+                     "001"
+                     "111";
+    case '4': return "101"
+                     "101"
+                     "111"
+                     "001"
+                     "001";
+    case '5': return "111"
+                     "100"
+                     "111"
+                     "001"
+                     "111";
+    case '6': return "111"
+                     "100"
+                     "111"
+                     "101"
+                     "111";
+    case '7': return "111"
+                     "001"
+                     "010"
+                     "010"
+                     "010";
+    case '8': return "111"
+                     "101"
+                     "111"
+                     "101"
+                     "111";
+    case '9': return "111"
+                     "101"
+                     "111"
+                     "001"
+                     "111";
+    case 'F': return "111"
+                     "100"
+                     "110"
+                     "100"
+                     "100";
+    case '/': return "001"
+                     "001"
+                     "010"
+                     "100"
+                     "100";
+    case '.': return "000"
+                     "000"
+                     "000"
+                     "000"
+                     "010";
+    case '-': return "000"
+                     "000"
+                     "111"
+                     "000"
+                     "000";
+    default:  return "000"
+                     "000"
+                     "000"
+                     "000"
+                     "000";
+  }
+}
+
+static uint8_t UI_BigCharWidth(uint8_t scale)
+{
+  return (uint8_t)(3U * scale);
+}
+
+static void UI_DrawBigChar(uint8_t x, uint8_t y, char c, uint8_t scale)
+{
+  const char *p = UI_BigPattern(c);
+
+  for (uint8_t row = 0; row < 5U; row++) {
+    for (uint8_t col = 0; col < 3U; col++) {
+      if (p[row * 3U + col] == '1') {
+        UI_FillRect((uint8_t)(x + col * scale),
+                    (uint8_t)(y + row * scale),
+                    scale,
+                    scale);
+      }
+    }
+  }
+}
+
+static uint8_t UI_BigStringWidth(const char *str, uint8_t scale, uint8_t spacing)
+{
+  uint8_t width = 0U;
+
+  while (*str != '\0') {
+    width = (uint8_t)(width + UI_BigCharWidth(scale));
+    str++;
+
+    if (*str != '\0') {
+      width = (uint8_t)(width + spacing);
+    }
+  }
+
+  return width;
+}
+
+static void UI_DrawBigStringCentered(uint8_t y, const char *str, uint8_t scale, uint8_t spacing)
+{
+  uint8_t width = UI_BigStringWidth(str, scale, spacing);
+  uint8_t x = 0U;
+
+  if (width < 128U) {
+    x = (uint8_t)((128U - width) / 2U);
+  }
+
+  while (*str != '\0') {
+    UI_DrawBigChar(x, y, *str, scale);
+    x = (uint8_t)(x + UI_BigCharWidth(scale) + spacing);
+    str++;
+  }
+}
+
+static void UI_DrawBatteryIcon(uint8_t x, uint8_t y, uint8_t percent)
+{
+  SSD1306_DrawRect(x, y, 14U, 7U, 1U);
+
+  /* Battery terminal */
+  SSD1306_DrawPixel((uint8_t)(x + 14U), (uint8_t)(y + 2U), 1U);
+  SSD1306_DrawPixel((uint8_t)(x + 14U), (uint8_t)(y + 3U), 1U);
+  SSD1306_DrawPixel((uint8_t)(x + 14U), (uint8_t)(y + 4U), 1U);
+
+  uint8_t bars;
+  if (percent > 75U) {
+    bars = 4U;
+  } else if (percent > 50U) {
+    bars = 3U;
+  } else if (percent > 25U) {
+    bars = 2U;
+  } else if (percent > 5U) {
+    bars = 1U;
+  } else {
+    bars = 0U;
+  }
+
+  for (uint8_t i = 0; i < bars; i++) {
+    UI_FillRect((uint8_t)(x + 2U + i * 3U), (uint8_t)(y + 2U), 2U, 3U);
+  }
+}
+
+static void UI_FormatShutter(char *buf, uint8_t size)
+{
+  if (shutter_den_tbl[g_shutter_idx] == 1U) {
+    snprintf(buf, size, "1");
+  } else {
+    snprintf(buf, size, "1/%u", shutter_den_tbl[g_shutter_idx]);
+  }
+}
+
+static void UI_FormatAperture(char *buf, uint8_t size)
+{
+  snprintf(buf, size, "F%u.%u",
+           aperture_x10_tbl[g_aperture_idx] / 10U,
+           aperture_x10_tbl[g_aperture_idx] % 10U);
+}
+
+static void Update_Display(void)
+{
+  char line[32];
+  char main_value[16];
+  char sub_value[16];
+
+  SSD1306_Clear();
+
+  /* Top status bar: mode / ISO / battery */
+  SSD1306_DrawString(0U, 0U, (g_mode == MODE_TV) ? "Tv" : "Av");
+
+  snprintf(line, sizeof(line), "ISO%u", iso_tbl[g_iso_idx]);
+  SSD1306_DrawString(38U, 0U, line);
+
+  snprintf(line, sizeof(line), "%u%%", g_bat_pct);
+  SSD1306_DrawString(86U, 0U, line);
+  UI_DrawBatteryIcon(112U, 0U, g_bat_pct);
+
+  SSD1306_DrawHLine(0U, 11U, 128U, 1U);
+
+  /* Main parameter follows current priority mode. */
+  if (g_mode == MODE_TV) {
+    UI_FormatShutter(main_value, sizeof(main_value));
+    UI_FormatAperture(sub_value, sizeof(sub_value));
+  } else {
+    UI_FormatAperture(main_value, sizeof(main_value));
+    UI_FormatShutter(sub_value, sizeof(sub_value));
+  }
+
+  /* Big main value */
+  UI_DrawBigStringCentered(15U, main_value, 5U, 3U);
+
+  SSD1306_DrawHLine(0U, 42U, 128U, 1U);
+
+  /* Recommended/secondary value */
+  UI_DrawBigStringCentered(45U, sub_value, 2U, 2U);
+
+  SSD1306_DrawHLine(0U, 55U, 128U, 1U);
+
+  /* Bottom auxiliary info */
+  snprintf(line, sizeof(line), "Lux:%lu", (unsigned long)(g_lux_x10 / 10UL));
+  SSD1306_DrawString(0U, 7U, line);
+
+  if (g_ev_x10 < 0) {
+    int16_t ev_abs = (int16_t)(-g_ev_x10);
+    snprintf(line, sizeof(line), "EV:-%d.%d", ev_abs / 10, ev_abs % 10);
+  } else {
+    snprintf(line, sizeof(line), "EV:%d.%d", g_ev_x10 / 10, g_ev_x10 % 10);
+  }
+  SSD1306_DrawString(76U, 7U, line);
+
+  SSD1306_Update();
+}
+
+/* USER CODE END 4 */
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  (void)file;
+  (void)line;
+}
+#endif
