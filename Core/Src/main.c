@@ -91,13 +91,13 @@ static ButtonState btn_mode;
 static ButtonState btn_iso;
 
 static const uint16_t shutter_den_tbl[] = {1, 2, 4, 8, 15, 30, 60, 125, 250, 500};
-static const uint16_t aperture_x10_tbl[] = {35, 40, 47, 56, 80, 110, 160, 220, 320, 450};
+static const uint16_t aperture_x10_tbl[] = {28, 35, 40, 47, 56, 80, 110, 160, 220, 320, 450};
 static const uint16_t iso_tbl[] = {100, 125, 160, 200, 400};
 
 static MeterMode g_mode = MODE_TV;
 static MeterHint g_hint = METER_SENSOR_ERR;
 static uint8_t g_shutter_idx = 6;   /* 1/60 */
-static uint8_t g_aperture_idx = 3;  /* f/5.6 */
+static uint8_t g_aperture_idx = 4;  /* f/5.6 */
 static uint8_t g_iso_idx = 0;
 static uint32_t g_lux_x10 = 0;
 static int16_t g_ev_x10 = 0;
