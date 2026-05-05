@@ -43,8 +43,21 @@ typedef struct {
   GPIO_PinState stable;
   GPIO_PinState last_read;
   uint32_t last_change_ms;
+  uint32_t press_start_ms;
   uint8_t ever_pressed;       /* GPIO keys cannot be probed; becomes OK after first valid press. */
+  uint8_t long_reported;
 } ButtonState;
+
+typedef enum {
+  BUTTON_EVENT_NONE = 0,
+  BUTTON_EVENT_SHORT,
+  BUTTON_EVENT_LONG
+} ButtonEvent;
+
+typedef enum {
+  SCREEN_SELF_TEST = 0,
+  SCREEN_METER = 1
+} AppScreen;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -60,7 +73,8 @@ typedef struct {
 #define RANGE_XSHUT_GPIO_Port     GPIOC
 #define RANGE_XSHUT_Pin           GPIO_PIN_13
 #define RANGE_INT_Pin             GPIO_PIN_14
-#define INPUT_STATUS_SHOW_MS      5000U  /* Show input self-test hints after boot. */
+#define SELF_TEST_HOLD_MS         5000U  /* Long press encoder button to enter self-test. */
+#define SELF_TEST_SHOW_MS         6000U  /* Boot/long-press self-test screen display time. */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -92,8 +106,10 @@ static uint8_t g_bat_pct = 0;
 static uint8_t g_sensor_ok = 0;
 static uint8_t g_encoder_seen = 0U;
 static uint8_t g_button_seen = 0U;
-static uint8_t g_input_hint_dismissed = 0U;
 static uint32_t g_app_start_ms = 0U;
+static AppScreen g_screen = SCREEN_SELF_TEST;
+static uint32_t g_selftest_start_ms = 0U;
+static uint8_t g_selftest_boot = 1U;
 static uint8_t g_range_needed = 0U;
 static uint8_t g_range_active = 0U;
 static uint8_t g_range_ok = 0U;
@@ -119,8 +135,11 @@ static uint8_t I2C1_TryLock(void);
 static void I2C1_Unlock(void);
 static void Meter_Recalculate(void);
 static int8_t Encoder_ReadDetents(void);
-static uint8_t Button_Fell(ButtonState *btn);
-static void UI_DrawModuleStatusLine(void);
+static ButtonEvent Button_Update(ButtonState *btn, uint32_t long_ms);
+static void SelfTest_Start(uint8_t boot_start);
+static void SelfTest_Task(void);
+static void UI_DrawSelfTest(void);
+static void UI_DrawBottomStatusBar(void);
 static uint16_t Battery_ReadMv(void);
 static uint8_t Battery_Percent(uint16_t mv);
 static uint8_t FindNearestShutter(float target_s);
@@ -239,14 +258,18 @@ static void App_Init(void)
   btn_mode.stable = KEY_RELEASED;
   btn_mode.last_read = KEY_RELEASED;
   btn_mode.last_change_ms = HAL_GetTick();
+  btn_mode.press_start_ms = 0U;
   btn_mode.ever_pressed = 0U;
+  btn_mode.long_reported = 0U;
 
   btn_iso.port = GPIOB;
   btn_iso.pin = GPIO_PIN_1;
   btn_iso.stable = KEY_RELEASED;
   btn_iso.last_read = KEY_RELEASED;
   btn_iso.last_change_ms = HAL_GetTick();
+  btn_iso.press_start_ms = 0U;
   btn_iso.ever_pressed = 0U;
+  btn_iso.long_reported = 0U;
 
   if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) == HAL_OK) {
     enc_last = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
@@ -286,6 +309,7 @@ static void App_Init(void)
 
   HAL_Delay(150);
   Update_Meter();
+  SelfTest_Start(1U);
   Update_Display();
 }
 
@@ -297,6 +321,7 @@ static void App_Task(void)
 
   Process_Input();
   Range_Task();
+  SelfTest_Task();
 
   if ((now - last_sensor_ms) >= SENSOR_PERIOD_MS) {
     last_sensor_ms = now;
@@ -312,37 +337,43 @@ static void App_Task(void)
 static void Process_Input(void)
 {
   int8_t detents = Encoder_ReadDetents();
+  ButtonEvent encoder_button_event = Button_Update(&btn_mode, SELF_TEST_HOLD_MS);
+  ButtonEvent iso_button_event = Button_Update(&btn_iso, 0U);
 
   if (detents != 0) {
     g_encoder_seen = 1U;
-    if ((btn_mode.ever_pressed != 0U) &&
-        (btn_iso.ever_pressed != 0U) &&
-        (g_sensor_ok != 0U)) {
-      g_input_hint_dismissed = 1U;
+
+    /* In self-test screen, rotation is only used to verify the encoder. */
+    if (g_screen != SCREEN_SELF_TEST) {
+      if (g_mode == MODE_TV) {
+        int16_t idx = (int16_t)g_shutter_idx + detents;
+        if (idx < 0) idx = 0;
+        if (idx >= (int16_t)ARRAY_LEN(shutter_den_tbl)) idx = (int16_t)ARRAY_LEN(shutter_den_tbl) - 1;
+        g_shutter_idx = (uint8_t)idx;
+      } else {
+        int16_t idx = (int16_t)g_aperture_idx + detents;
+        if (idx < 0) idx = 0;
+        if (idx >= (int16_t)ARRAY_LEN(aperture_x10_tbl)) idx = (int16_t)ARRAY_LEN(aperture_x10_tbl) - 1;
+        g_aperture_idx = (uint8_t)idx;
+      }
+      Meter_Recalculate();
     }
 
-    if (g_mode == MODE_TV) {
-      int16_t idx = (int16_t)g_shutter_idx + detents;
-      if (idx < 0) idx = 0;
-      if (idx >= (int16_t)ARRAY_LEN(shutter_den_tbl)) idx = (int16_t)ARRAY_LEN(shutter_den_tbl) - 1;
-      g_shutter_idx = (uint8_t)idx;
-    } else {
-      int16_t idx = (int16_t)g_aperture_idx + detents;
-      if (idx < 0) idx = 0;
-      if (idx >= (int16_t)ARRAY_LEN(aperture_x10_tbl)) idx = (int16_t)ARRAY_LEN(aperture_x10_tbl) - 1;
-      g_aperture_idx = (uint8_t)idx;
-    }
-    Meter_Recalculate();
     Update_Display();
   }
 
-  if (Button_Fell(&btn_mode)) {
+  if (encoder_button_event == BUTTON_EVENT_LONG) {
+    /* Current IOC has no separate encoder-SW pin. PB0 is treated as encoder push.
+       Short press keeps the original Mode action; 5s long press opens self-test. */
+    SelfTest_Start(0U);
+    Update_Display();
+  } else if ((encoder_button_event == BUTTON_EVENT_SHORT) && (g_screen != SCREEN_SELF_TEST)) {
     g_mode = (g_mode == MODE_TV) ? MODE_AV : MODE_TV;
     Meter_Recalculate();
     Update_Display();
   }
 
-  if (Button_Fell(&btn_iso)) {
+  if ((iso_button_event == BUTTON_EVENT_SHORT) && (g_screen != SCREEN_SELF_TEST)) {
     g_iso_idx++;
     if (g_iso_idx >= ARRAY_LEN(iso_tbl)) g_iso_idx = 0;
     Meter_Recalculate();
@@ -448,9 +479,11 @@ static void Range_SetNeeded(uint8_t needed)
 
 static uint8_t Range_IsNeeded(void)
 {
-  /* Replace this return value with the actual UI/standby condition.
-     Example: return (g_standby == 0U && g_mode == MODE_RANGE) ? 1U : 0U;
-     Returning 1 keeps the demo measuring continuously while the system is awake. */
+  /* Self-test needs range powered so it can verify VL53L1X presence.
+     Replace the normal return value with the actual UI/standby condition later. */
+  if (g_screen == SCREEN_SELF_TEST) {
+    return 1U;
+  }
   return 1U;
 }
 
@@ -541,7 +574,7 @@ static int8_t Encoder_ReadDetents(void)
   return detents;
 }
 
-static uint8_t Button_Fell(ButtonState *btn)
+static ButtonEvent Button_Update(ButtonState *btn, uint32_t long_ms)
 {
   GPIO_PinState read = HAL_GPIO_ReadPin(btn->port, btn->pin);
   uint32_t now = HAL_GetTick();
@@ -554,51 +587,129 @@ static uint8_t Button_Fell(ButtonState *btn)
   if ((now - btn->last_change_ms) >= KEY_DEBOUNCE_MS) {
     if (read != btn->stable) {
       btn->stable = read;
+
       if (btn->stable == KEY_PRESSED) {
         btn->ever_pressed = 1U;
         g_button_seen = 1U;
-        if ((g_encoder_seen != 0U) &&
-            (btn_mode.ever_pressed != 0U) &&
-            (btn_iso.ever_pressed != 0U) &&
-            (g_sensor_ok != 0U)) {
-          g_input_hint_dismissed = 1U;
+        btn->press_start_ms = now;
+        btn->long_reported = 0U;
+      } else {
+        if ((btn->long_reported == 0U) && (btn->press_start_ms != 0U)) {
+          btn->press_start_ms = 0U;
+          return BUTTON_EVENT_SHORT;
         }
-        return 1U;
+        btn->press_start_ms = 0U;
       }
     }
   }
-  return 0U;
+
+  if ((long_ms != 0U) &&
+      (btn->stable == KEY_PRESSED) &&
+      (btn->press_start_ms != 0U) &&
+      (btn->long_reported == 0U) &&
+      ((now - btn->press_start_ms) >= long_ms)) {
+    btn->long_reported = 1U;
+    return BUTTON_EVENT_LONG;
+  }
+
+  return BUTTON_EVENT_NONE;
 }
 
-
-static void UI_DrawModuleStatusLine(void)
+static void SelfTest_Start(uint8_t boot_start)
 {
-  char line[32];
-  uint8_t show_input_hint;
+  g_screen = SCREEN_SELF_TEST;
+  g_selftest_start_ms = HAL_GetTick();
+  g_selftest_boot = (boot_start != 0U) ? 1U : 0U;
 
-  show_input_hint = (g_input_hint_dismissed == 0U) ||
-                    ((HAL_GetTick() - g_app_start_ms) < INPUT_STATUS_SHOW_MS);
+  /* Start one non-blocking round for I2C devices. Passive GPIO inputs
+     (encoder/buttons) can only become OK after the user operates them. */
+  Range_SetNeeded(1U);
+  Range_Task();
+  Update_Meter();
+}
 
-  if ((g_sensor_ok == 0U) || (show_input_hint != 0U)) {
-    snprintf(line, sizeof(line), "E:%s M:%s I:%s L:%s",
-             (g_encoder_seen != 0U) ? "OK" : "--",
-             (btn_mode.ever_pressed != 0U) ? "OK" : "--",
-             (btn_iso.ever_pressed != 0U) ? "OK" : "--",
-             (g_sensor_ok != 0U) ? "OK" : "OFF");
-    SSD1306_DrawString(0U, 6U, line);
+static void SelfTest_Task(void)
+{
+  if (g_screen != SCREEN_SELF_TEST) {
     return;
   }
 
+  /* Show one result page, then automatically return to the normal meter UI. */
+  if ((HAL_GetTick() - g_selftest_start_ms) >= SELF_TEST_SHOW_MS) {
+    g_screen = SCREEN_METER;
+    g_selftest_boot = 0U;
+    Update_Display();
+  }
+}
+
+static void UI_DrawSelfTest(void)
+{
+  char line[32];
+
+  SSD1306_Clear();
+  SSD1306_DrawString(18U, 0U, g_selftest_boot ? "BOOT SELF TEST" : "SELF TEST");
+  SSD1306_DrawHLine(0U, 11U, 128U, 1U);
+
+  snprintf(line, sizeof(line), "ENC : %s", (g_encoder_seen != 0U) ? "OK" : "TURN");
+  SSD1306_DrawString(0U, 2U, line);
+
+  snprintf(line, sizeof(line), "MODE: %s", (btn_mode.ever_pressed != 0U) ? "OK" : "PRESS");
+  SSD1306_DrawString(0U, 3U, line);
+
+  snprintf(line, sizeof(line), "ISO : %s", (btn_iso.ever_pressed != 0U) ? "OK" : "PRESS");
+  SSD1306_DrawString(0U, 4U, line);
+
+  snprintf(line, sizeof(line), "LUX : %s", (g_sensor_ok != 0U) ? "OK" : "OFF");
+  SSD1306_DrawString(0U, 5U, line);
+
+  if (g_range_ok != 0U) {
+    snprintf(line, sizeof(line), "DIST: OK %ucm", (unsigned int)(g_range_mm / 10U));
+  } else if (g_range_active != 0U) {
+    snprintf(line, sizeof(line), "DIST: WAIT");
+  } else {
+    snprintf(line, sizeof(line), "DIST: OFF");
+  }
+  SSD1306_DrawString(0U, 6U, line);
+
+  SSD1306_DrawString(0U, 7U, "Hold ENC 5s: test");
+}
+
+static void UI_DrawBottomStatusBar(void)
+{
+  char line[32];
+
+  /* Left: light sensor */
+  if (g_sensor_ok != 0U) {
+    snprintf(line, sizeof(line), "L:%lu", (unsigned long)(g_lux_x10 / 10UL));
+  } else {
+    snprintf(line, sizeof(line), "L:--");
+  }
+  SSD1306_DrawString(0U, 7U, line);
+
+  /* Middle: distance, unit is cm */
   if (g_range_active != 0U) {
     if (g_range_ok != 0U) {
-      snprintf(line, sizeof(line), "Dist:%ucm", (unsigned int)(g_range_mm / 10U));
+      snprintf(line, sizeof(line), "D:%u", (unsigned int)(g_range_mm / 10U));
     } else {
-      snprintf(line, sizeof(line), "Dist:--");
+      snprintf(line, sizeof(line), "D:--");
     }
-    SSD1306_DrawString(0U, 6U, line);
   } else {
-    SSD1306_DrawString(0U, 6U, "Dist:OFF");
+    snprintf(line, sizeof(line), "D:--");
   }
+  SSD1306_DrawString(46U, 7U, line);
+
+  /* Right: exposure value */
+  if (g_sensor_ok != 0U) {
+    if (g_ev_x10 < 0) {
+      int16_t ev_abs = (int16_t)(-g_ev_x10);
+      snprintf(line, sizeof(line), "EV-%d.%d", ev_abs / 10, ev_abs % 10);
+    } else {
+      snprintf(line, sizeof(line), "EV%d.%d", g_ev_x10 / 10, g_ev_x10 % 10);
+    }
+  } else {
+    snprintf(line, sizeof(line), "EV--");
+  }
+  SSD1306_DrawString(90U, 7U, line);
 }
 
 static uint16_t Battery_ReadMv(void)
@@ -858,6 +969,15 @@ static void Update_Display(void)
   char main_value[16];
   char sub_value[16];
 
+  if (g_screen == SCREEN_SELF_TEST) {
+    UI_DrawSelfTest();
+    if (I2C1_TryLock()) {
+      SSD1306_Update();
+      I2C1_Unlock();
+    }
+    return;
+  }
+
   SSD1306_Clear();
 
   /* Top status bar: mode / ISO / battery */
@@ -891,26 +1011,9 @@ static void Update_Display(void)
 
   SSD1306_DrawHLine(0U, 55U, 128U, 1U);
 
-  /* Bottom auxiliary info.
-     VEML7700 can be truly detected over I2C. Encoder/buttons are passive GPIO
-     parts, so the firmware can only mark them OK after the first valid action. */
-  UI_DrawModuleStatusLine();
-
-  if (g_sensor_ok != 0U) {
-    snprintf(line, sizeof(line), "Lux:%lu", (unsigned long)(g_lux_x10 / 10UL));
-    SSD1306_DrawString(0U, 7U, line);
-
-    if (g_ev_x10 < 0) {
-      int16_t ev_abs = (int16_t)(-g_ev_x10);
-      snprintf(line, sizeof(line), "EV:-%d.%d", ev_abs / 10, ev_abs % 10);
-    } else {
-      snprintf(line, sizeof(line), "EV:%d.%d", g_ev_x10 / 10, g_ev_x10 % 10);
-    }
-    SSD1306_DrawString(76U, 7U, line);
-  } else {
-    SSD1306_DrawString(0U, 7U, "Lux:OFFLINE");
-    SSD1306_DrawString(76U, 7U, "EV:--");
-  }
+  /* Bottom status bar: Lux left, Dist center, EV right.
+     Distance no longer uses the F-value area above this bar. */
+  UI_DrawBottomStatusBar();
 
   if (I2C1_TryLock()) {
     SSD1306_Update();
