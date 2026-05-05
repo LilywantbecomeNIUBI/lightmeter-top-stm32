@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/veml7700.c
     Core/Src/ssd1306_i2c.c
+    Core/Src/vl53l1x_hal.c
 )
 
 # Add include paths

@@ -6,7 +6,7 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
 #include "i2c.h"
@@ -14,26 +14,16 @@
 #include "usart.h"
 #include "gpio.h"
 
+/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ssd1306_i2c.h"
 #include "veml7700.h"
+#include "vl53l1x_hal.h"
 #include <stdio.h>
 #include <stdint.h>
 /* USER CODE END Includes */
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-
-/* USER CODE BEGIN PD */
-#define ARRAY_LEN(a)              (sizeof(a) / sizeof((a)[0]))
-#define ENCODER_STEP              4
-#define KEY_PRESSED               GPIO_PIN_RESET
-#define KEY_RELEASED              GPIO_PIN_SET
-#define KEY_DEBOUNCE_MS           35U
-#define SENSOR_PERIOD_MS          400U
-#define UI_PERIOD_MS              180U
-/* USER CODE END PD */
-
+/* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum {
   MODE_TV = 0,   /* shutter priority */
@@ -53,11 +43,36 @@ typedef struct {
   GPIO_PinState stable;
   GPIO_PinState last_read;
   uint32_t last_change_ms;
+  uint8_t ever_pressed;       /* GPIO keys cannot be probed; becomes OK after first valid press. */
 } ButtonState;
 /* USER CODE END PTD */
 
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define ARRAY_LEN(a)              (sizeof(a) / sizeof((a)[0]))
+#define ENCODER_STEP              4
+#define KEY_PRESSED               GPIO_PIN_RESET
+#define KEY_RELEASED              GPIO_PIN_SET
+#define KEY_DEBOUNCE_MS           35U
+#define SENSOR_PERIOD_MS          400U
+#define UI_PERIOD_MS              180U
+#define RANGE_RESTART_MS          1000U
+#define RANGE_XSHUT_GPIO_Port     GPIOC
+#define RANGE_XSHUT_Pin           GPIO_PIN_13
+#define RANGE_INT_Pin             GPIO_PIN_14
+#define INPUT_STATUS_SHOW_MS      5000U  /* Show input self-test hints after boot. */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
 /* USER CODE BEGIN PV */
 static VEML7700_HandleTypeDef hveml;
+static VL53L1X_HandleTypeDef hvl53;
 static ButtonState btn_mode;
 static ButtonState btn_iso;
 
@@ -75,17 +90,37 @@ static int16_t g_ev_x10 = 0;
 static uint16_t g_bat_mv = 0;
 static uint8_t g_bat_pct = 0;
 static uint8_t g_sensor_ok = 0;
+static uint8_t g_encoder_seen = 0U;
+static uint8_t g_button_seen = 0U;
+static uint8_t g_input_hint_dismissed = 0U;
+static uint32_t g_app_start_ms = 0U;
+static uint8_t g_range_needed = 0U;
+static uint8_t g_range_active = 0U;
+static uint8_t g_range_ok = 0U;
+static uint16_t g_range_mm = 0U;
+static uint8_t g_range_status = 0xFFU;
+static uint32_t g_range_retry_ms = 0U;
+static volatile uint8_t g_vl53_int_flag = 0U;
+static volatile uint8_t g_i2c1_busy = 0U;
 static int16_t enc_last = 0;
 /* USER CODE END PV */
 
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void App_Init(void);
 static void App_Task(void);
 static void Process_Input(void);
 static void Update_Meter(void);
+static void Range_Task(void);
+static void Range_SetNeeded(uint8_t needed);
+static uint8_t Range_IsNeeded(void);
+static uint8_t I2C1_TryLock(void);
+static void I2C1_Unlock(void);
 static void Meter_Recalculate(void);
 static int8_t Encoder_ReadDetents(void);
 static uint8_t Button_Fell(ButtonState *btn);
+static void UI_DrawModuleStatusLine(void);
 static uint16_t Battery_ReadMv(void);
 static uint8_t Battery_Percent(uint16_t mv);
 static uint8_t FindNearestShutter(float target_s);
@@ -94,27 +129,58 @@ static int16_t EV10_FromLuxIso(uint32_t lux_x10, uint16_t iso);
 static void Update_Display(void);
 /* USER CODE END PFP */
 
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
 
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
-
   /* USER CODE BEGIN 2 */
   App_Init();
   /* USER CODE END 2 */
 
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE BEGIN WHILE */
     App_Task();
     /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -127,6 +193,9 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -139,6 +208,8 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -161,36 +232,57 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 static void App_Init(void)
 {
+  g_app_start_ms = HAL_GetTick();
+
   btn_mode.port = GPIOB;
   btn_mode.pin = GPIO_PIN_0;
   btn_mode.stable = KEY_RELEASED;
   btn_mode.last_read = KEY_RELEASED;
   btn_mode.last_change_ms = HAL_GetTick();
+  btn_mode.ever_pressed = 0U;
 
   btn_iso.port = GPIOB;
   btn_iso.pin = GPIO_PIN_1;
   btn_iso.stable = KEY_RELEASED;
   btn_iso.last_read = KEY_RELEASED;
   btn_iso.last_change_ms = HAL_GetTick();
+  btn_iso.ever_pressed = 0U;
 
-  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-  enc_last = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) == HAL_OK) {
+    enc_last = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  } else {
+    g_encoder_seen = 0U;
+  }
   HAL_ADC_Start(&hadc1);
 
-  if (SSD1306_Init(&hi2c1) == HAL_OK) {
-    SSD1306_Clear();
-    SSD1306_DrawString(0, 0, "Light Meter Top");
-    SSD1306_DrawString(0, 2, "Init VEML7700...");
-    SSD1306_Update();
+  /* XSHUT must already be configured as PC13 output-high by MX_GPIO_Init().
+     Keep it high before the first VL53L1X I2C register access. */
+  HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
+  (void)VL53L1X_Attach(&hvl53, &hi2c1, RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin);
+
+  if (I2C1_TryLock()) {
+    if (SSD1306_Init(&hi2c1) == HAL_OK) {
+      SSD1306_Clear();
+      SSD1306_DrawString(0, 0, "Light Meter Top");
+      SSD1306_DrawString(0, 2, "Init VEML7700...");
+      SSD1306_Update();
+    }
+    I2C1_Unlock();
   }
 
-  if (VEML7700_Init(&hveml, &hi2c1) != HAL_OK) {
-    g_sensor_ok = 0;
-    g_hint = METER_SENSOR_ERR;
-  } else {
-    g_sensor_ok = 1;
-    g_hint = METER_OK;
+  if (I2C1_TryLock()) {
+    if (VEML7700_Init(&hveml, &hi2c1) != HAL_OK) {
+      g_sensor_ok = 0;
+      g_hint = METER_SENSOR_ERR;
+    } else {
+      g_sensor_ok = 1;
+      g_hint = METER_OK;
+    }
+    I2C1_Unlock();
   }
+
+  Range_SetNeeded(Range_IsNeeded());
+  Range_Task();
 
   HAL_Delay(150);
   Update_Meter();
@@ -204,6 +296,7 @@ static void App_Task(void)
   uint32_t now = HAL_GetTick();
 
   Process_Input();
+  Range_Task();
 
   if ((now - last_sensor_ms) >= SENSOR_PERIOD_MS) {
     last_sensor_ms = now;
@@ -221,6 +314,13 @@ static void Process_Input(void)
   int8_t detents = Encoder_ReadDetents();
 
   if (detents != 0) {
+    g_encoder_seen = 1U;
+    if ((btn_mode.ever_pressed != 0U) &&
+        (btn_iso.ever_pressed != 0U) &&
+        (g_sensor_ok != 0U)) {
+      g_input_hint_dismissed = 1U;
+    }
+
     if (g_mode == MODE_TV) {
       int16_t idx = (int16_t)g_shutter_idx + detents;
       if (idx < 0) idx = 0;
@@ -253,17 +353,126 @@ static void Process_Input(void)
 static void Update_Meter(void)
 {
   uint32_t lux_x10;
-  if (VEML7700_ReadLuxAutoX10(&hveml, &lux_x10) == HAL_OK) {
-    g_lux_x10 = lux_x10;
-    g_sensor_ok = 1;
-  } else {
-    g_sensor_ok = 0;
-    g_hint = METER_SENSOR_ERR;
+
+  if (I2C1_TryLock()) {
+    if (VEML7700_ReadLuxAutoX10(&hveml, &lux_x10) == HAL_OK) {
+      g_lux_x10 = lux_x10;
+      g_sensor_ok = 1;
+    } else {
+      g_sensor_ok = 0;
+      g_hint = METER_SENSOR_ERR;
+    }
+    I2C1_Unlock();
   }
 
   g_bat_mv = Battery_ReadMv();
   g_bat_pct = Battery_Percent(g_bat_mv);
   Meter_Recalculate();
+}
+
+static void Range_Task(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  Range_SetNeeded(Range_IsNeeded());
+
+  if (g_range_needed == 0U) {
+    return;
+  }
+
+  if (g_range_active == 0U) {
+    if ((g_range_retry_ms != 0U) && ((now - g_range_retry_ms) < RANGE_RESTART_MS)) {
+      return;
+    }
+
+    if (I2C1_TryLock()) {
+      if ((VL53L1X_PowerOnInit(&hvl53) == HAL_OK) &&
+          (VL53L1X_StartRanging(&hvl53) == HAL_OK)) {
+        g_range_active = 1U;
+        g_range_ok = 0U;
+        g_vl53_int_flag = 0U;
+      } else {
+        g_range_active = 0U;
+        g_range_ok = 0U;
+        g_range_retry_ms = now;
+        VL53L1X_PowerOff(&hvl53);
+      }
+      I2C1_Unlock();
+    }
+    return;
+  }
+
+  if (g_vl53_int_flag != 0U) {
+    uint16_t distance = 0U;
+    uint8_t status = 0xFFU;
+
+    if (I2C1_TryLock()) {
+      g_vl53_int_flag = 0U;
+      if (VL53L1X_ReadAndClear(&hvl53, &distance, &status) == HAL_OK) {
+        g_range_mm = distance;
+        g_range_status = status;
+        g_range_ok = (status == 0U) ? 1U : 0U;
+      } else {
+        g_range_ok = 0U;
+        g_range_active = 0U;
+        g_range_retry_ms = now;
+        VL53L1X_PowerOff(&hvl53);
+      }
+      I2C1_Unlock();
+    }
+  }
+}
+
+static void Range_SetNeeded(uint8_t needed)
+{
+  needed = (needed != 0U) ? 1U : 0U;
+
+  if (needed == g_range_needed) {
+    return;
+  }
+
+  g_range_needed = needed;
+
+  if (g_range_needed == 0U) {
+    if (I2C1_TryLock()) {
+      VL53L1X_PowerOff(&hvl53);
+      I2C1_Unlock();
+    } else {
+      HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_RESET);
+    }
+    g_range_active = 0U;
+    g_range_ok = 0U;
+    g_vl53_int_flag = 0U;
+  }
+}
+
+static uint8_t Range_IsNeeded(void)
+{
+  /* Replace this return value with the actual UI/standby condition.
+     Example: return (g_standby == 0U && g_mode == MODE_RANGE) ? 1U : 0U;
+     Returning 1 keeps the demo measuring continuously while the system is awake. */
+  return 1U;
+}
+
+static uint8_t I2C1_TryLock(void)
+{
+  uint8_t ok = 0U;
+
+  __disable_irq();
+  if (g_i2c1_busy == 0U) {
+    g_i2c1_busy = 1U;
+    ok = 1U;
+  }
+  __enable_irq();
+
+  return ok;
+}
+
+static void I2C1_Unlock(void)
+{
+  __disable_irq();
+  g_i2c1_busy = 0U;
+  __enable_irq();
 }
 
 static void Meter_Recalculate(void)
@@ -346,11 +555,50 @@ static uint8_t Button_Fell(ButtonState *btn)
     if (read != btn->stable) {
       btn->stable = read;
       if (btn->stable == KEY_PRESSED) {
+        btn->ever_pressed = 1U;
+        g_button_seen = 1U;
+        if ((g_encoder_seen != 0U) &&
+            (btn_mode.ever_pressed != 0U) &&
+            (btn_iso.ever_pressed != 0U) &&
+            (g_sensor_ok != 0U)) {
+          g_input_hint_dismissed = 1U;
+        }
         return 1U;
       }
     }
   }
   return 0U;
+}
+
+
+static void UI_DrawModuleStatusLine(void)
+{
+  char line[32];
+  uint8_t show_input_hint;
+
+  show_input_hint = (g_input_hint_dismissed == 0U) ||
+                    ((HAL_GetTick() - g_app_start_ms) < INPUT_STATUS_SHOW_MS);
+
+  if ((g_sensor_ok == 0U) || (show_input_hint != 0U)) {
+    snprintf(line, sizeof(line), "E:%s M:%s I:%s L:%s",
+             (g_encoder_seen != 0U) ? "OK" : "--",
+             (btn_mode.ever_pressed != 0U) ? "OK" : "--",
+             (btn_iso.ever_pressed != 0U) ? "OK" : "--",
+             (g_sensor_ok != 0U) ? "OK" : "OFF");
+    SSD1306_DrawString(0U, 6U, line);
+    return;
+  }
+
+  if (g_range_active != 0U) {
+    if (g_range_ok != 0U) {
+      snprintf(line, sizeof(line), "Dist:%ucm", (unsigned int)(g_range_mm / 10U));
+    } else {
+      snprintf(line, sizeof(line), "Dist:--");
+    }
+    SSD1306_DrawString(0U, 6U, line);
+  } else {
+    SSD1306_DrawString(0U, 6U, "Dist:OFF");
+  }
 }
 
 static uint16_t Battery_ReadMv(void)
@@ -643,35 +891,70 @@ static void Update_Display(void)
 
   SSD1306_DrawHLine(0U, 55U, 128U, 1U);
 
-  /* Bottom auxiliary info */
-  snprintf(line, sizeof(line), "Lux:%lu", (unsigned long)(g_lux_x10 / 10UL));
-  SSD1306_DrawString(0U, 7U, line);
+  /* Bottom auxiliary info.
+     VEML7700 can be truly detected over I2C. Encoder/buttons are passive GPIO
+     parts, so the firmware can only mark them OK after the first valid action. */
+  UI_DrawModuleStatusLine();
 
-  if (g_ev_x10 < 0) {
-    int16_t ev_abs = (int16_t)(-g_ev_x10);
-    snprintf(line, sizeof(line), "EV:-%d.%d", ev_abs / 10, ev_abs % 10);
+  if (g_sensor_ok != 0U) {
+    snprintf(line, sizeof(line), "Lux:%lu", (unsigned long)(g_lux_x10 / 10UL));
+    SSD1306_DrawString(0U, 7U, line);
+
+    if (g_ev_x10 < 0) {
+      int16_t ev_abs = (int16_t)(-g_ev_x10);
+      snprintf(line, sizeof(line), "EV:-%d.%d", ev_abs / 10, ev_abs % 10);
+    } else {
+      snprintf(line, sizeof(line), "EV:%d.%d", g_ev_x10 / 10, g_ev_x10 % 10);
+    }
+    SSD1306_DrawString(76U, 7U, line);
   } else {
-    snprintf(line, sizeof(line), "EV:%d.%d", g_ev_x10 / 10, g_ev_x10 % 10);
+    SSD1306_DrawString(0U, 7U, "Lux:OFFLINE");
+    SSD1306_DrawString(76U, 7U, "EV:--");
   }
-  SSD1306_DrawString(76U, 7U, line);
 
-  SSD1306_Update();
+  if (I2C1_TryLock()) {
+    SSD1306_Update();
+    I2C1_Unlock();
+  }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == RANGE_INT_Pin) {
+    /* ISR only sets a flag. Never touch I2C here. */
+    g_vl53_int_flag = 1U;
+  }
 }
 
 /* USER CODE END 4 */
 
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  (void)file;
-  (void)line;
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
-#endif
+#endif /* USE_FULL_ASSERT */

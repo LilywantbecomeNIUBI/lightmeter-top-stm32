@@ -57,6 +57,11 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define VL53L1X_XSHUT_Pin GPIO_PIN_13
+#define VL53L1X_XSHUT_GPIO_Port GPIOC
+#define VL53L1X_INT_Pin GPIO_PIN_14
+#define VL53L1X_INT_GPIO_Port GPIOC
+#define VL53L1X_INT_EXTI_IRQn EXTI15_10_IRQn
 
 /* USER CODE BEGIN Private defines */
 
