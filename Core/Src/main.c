@@ -73,6 +73,9 @@ typedef enum {
 #define RANGE_RESTART_MS          1000U
 #define RANGE_POLL_MS             120U
 #define RANGE_FORCE_ALWAYS_ON     1U
+#define DISPLAY_IIR_SHIFT         2U
+#define DISPLAY_LUX_STABLE_X10    30UL
+#define DISPLAY_RANGE_STABLE_MM   20U
 #define RANGE_XSHUT_GPIO_Port     GPIOC
 #define RANGE_XSHUT_Pin           GPIO_PIN_13
 #define RANGE_INT_Pin             GPIO_PIN_14
@@ -107,6 +110,9 @@ static int16_t g_ev_x10 = 0;
 static uint16_t g_bat_mv = 0;
 static uint8_t g_bat_pct = 0;
 static uint8_t g_sensor_ok = 0;
+static uint8_t g_lux_disp_valid = 0U;
+static uint8_t g_lux_disp_stable = 0U;
+static uint32_t g_lux_disp_x10 = 0U;
 static uint8_t g_encoder_seen = 0U;
 static uint8_t g_button_seen = 0U;
 static uint32_t g_app_start_ms = 0U;
@@ -117,7 +123,10 @@ static uint8_t g_range_needed = 0U;
 static uint8_t g_range_active = 0U;
 static uint8_t g_range_ok = 0U;
 static uint8_t g_range_read_seen = 0U;
+static uint8_t g_range_disp_valid = 0U;
+static uint8_t g_range_disp_stable = 0U;
 static uint16_t g_range_mm = 0U;
+static uint16_t g_range_disp_mm = 0U;
 static uint8_t g_range_status = 0xFFU;
 static uint32_t g_range_retry_ms = 0U;
 static uint32_t g_range_last_poll_ms = 0U;
@@ -137,6 +146,10 @@ static void Range_Task(void);
 static void Range_SetNeeded(uint8_t needed);
 static uint8_t Range_IsNeeded(void);
 static const char *Range_DebugText(void);
+static void DisplayFilter_UpdateLux(uint32_t lux_x10);
+static void DisplayFilter_UpdateRange(uint16_t range_mm);
+static uint32_t IIR_UpdateU32(uint32_t current, uint32_t target);
+static uint32_t AbsDiffU32(uint32_t a, uint32_t b);
 static uint8_t I2C1_TryLock(void);
 static void I2C1_Unlock(void);
 static void Meter_Recalculate(void);
@@ -395,8 +408,10 @@ static void Update_Meter(void)
     if (VEML7700_ReadLuxAutoX10(&hveml, &lux_x10) == HAL_OK) {
       g_lux_x10 = lux_x10;
       g_sensor_ok = 1;
+      DisplayFilter_UpdateLux(lux_x10);
     } else {
       g_sensor_ok = 0;
+      g_lux_disp_valid = 0U;
       g_hint = METER_SENSOR_ERR;
     }
     I2C1_Unlock();
@@ -467,6 +482,11 @@ static void Range_Task(void)
         g_range_status = status;
         g_range_read_seen = 1U;
         g_range_ok = (status == 0U) ? 1U : 0U;
+        if (g_range_ok != 0U) {
+          DisplayFilter_UpdateRange(distance);
+        } else {
+          g_range_disp_stable = 0U;
+        }
       } else {
         hvl53.last_error_stage = VL53L1X_STAGE_READ;
         g_range_ok = 0U;
@@ -511,6 +531,7 @@ static void Range_SetNeeded(uint8_t needed)
     g_range_active = 0U;
     g_range_ok = 0U;
     g_range_read_seen = 0U;
+    g_range_disp_valid = 0U;
     g_vl53_int_flag = 0U;
   }
 }
@@ -545,6 +566,62 @@ static const char *Range_DebugText(void)
     default:
       return "TRY";
   }
+}
+
+static void DisplayFilter_UpdateLux(uint32_t lux_x10)
+{
+  if (g_lux_disp_valid == 0U) {
+    g_lux_disp_x10 = lux_x10;
+    g_lux_disp_valid = 1U;
+  } else {
+    g_lux_disp_x10 = IIR_UpdateU32(g_lux_disp_x10, lux_x10);
+  }
+
+  g_lux_disp_stable =
+      (AbsDiffU32(g_lux_disp_x10, lux_x10) <= DISPLAY_LUX_STABLE_X10) ? 1U : 0U;
+}
+
+static void DisplayFilter_UpdateRange(uint16_t range_mm)
+{
+  uint32_t filtered;
+
+  if (g_range_disp_valid == 0U) {
+    g_range_disp_mm = range_mm;
+    g_range_disp_valid = 1U;
+  } else {
+    filtered = IIR_UpdateU32((uint32_t)g_range_disp_mm, (uint32_t)range_mm);
+    g_range_disp_mm = (uint16_t)filtered;
+  }
+
+  g_range_disp_stable =
+      (AbsDiffU32((uint32_t)g_range_disp_mm, (uint32_t)range_mm) <= DISPLAY_RANGE_STABLE_MM) ? 1U : 0U;
+}
+
+static uint32_t IIR_UpdateU32(uint32_t current, uint32_t target)
+{
+  uint32_t delta;
+  uint32_t step;
+
+  if (target == current) {
+    return current;
+  }
+
+  if (target > current) {
+    delta = target - current;
+    step = delta >> DISPLAY_IIR_SHIFT;
+    if (step == 0U) step = 1U;
+    return current + step;
+  }
+
+  delta = current - target;
+  step = delta >> DISPLAY_IIR_SHIFT;
+  if (step == 0U) step = 1U;
+  return current - step;
+}
+
+static uint32_t AbsDiffU32(uint32_t a, uint32_t b)
+{
+  return (a >= b) ? (a - b) : (b - a);
 }
 
 static uint8_t I2C1_TryLock(void)
@@ -749,8 +826,10 @@ static void UI_DrawBottomStatusBar(void)
   char line[32];
 
   /* Left: light sensor */
-  if (g_sensor_ok != 0U) {
-    snprintf(line, sizeof(line), "L:%lu", (unsigned long)(g_lux_x10 / 10UL));
+  if ((g_sensor_ok != 0U) && (g_lux_disp_valid != 0U)) {
+    snprintf(line, sizeof(line), "L:%s%lu",
+             (g_lux_disp_stable != 0U) ? "" : "~",
+             (unsigned long)(g_lux_disp_x10 / 10UL));
   } else {
     snprintf(line, sizeof(line), "L:--");
   }
@@ -758,10 +837,11 @@ static void UI_DrawBottomStatusBar(void)
 
   /* Middle: distance, unit is m */
   if (g_range_active != 0U) {
-    if (g_range_ok != 0U) {
-      snprintf(line, sizeof(line), "D:%u.%02um",
-               (unsigned int)(g_range_mm / 1000U),
-               (unsigned int)((g_range_mm % 1000U) / 10U));
+    if ((g_range_ok != 0U) && (g_range_disp_valid != 0U)) {
+      snprintf(line, sizeof(line), "D:%s%u.%02um",
+               (g_range_disp_stable != 0U) ? "" : "~",
+               (unsigned int)(g_range_disp_mm / 1000U),
+               (unsigned int)((g_range_disp_mm % 1000U) / 10U));
     } else if (g_range_read_seen != 0U) {
       snprintf(line, sizeof(line), "D:S%02X", (unsigned int)g_range_status);
     } else {
@@ -770,7 +850,7 @@ static void UI_DrawBottomStatusBar(void)
   } else {
     snprintf(line, sizeof(line), "D:--");
   }
-  SSD1306_DrawString(46U, 7U, line);
+  SSD1306_DrawString(42U, 7U, line);
 
   /* Right: exposure value */
   if (g_sensor_ok != 0U) {
