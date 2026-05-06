@@ -9,7 +9,15 @@ extern "C" {
 #endif
 
 #define VL53L1X_I2C_ADDR_7BIT        0x29U
-#define VL53L1X_MODEL_ID_EXPECTED    0xEEACU
+#define VL53L1X_MODEL_ID_EXPECTED    0xEACCU
+#define VL53L1X_STAGE_NONE           0U
+#define VL53L1X_STAGE_BOOT           1U
+#define VL53L1X_STAGE_ID             2U
+#define VL53L1X_STAGE_CFG            3U
+#define VL53L1X_STAGE_INT            4U
+#define VL53L1X_STAGE_CLR            5U
+#define VL53L1X_STAGE_START          6U
+#define VL53L1X_STAGE_READ           7U
 
 typedef struct {
   I2C_HandleTypeDef *hi2c;
@@ -17,7 +25,11 @@ typedef struct {
   uint16_t xshut_pin;
   uint8_t initialized;
   uint8_t ranging;
+  uint8_t last_error_stage;
+  uint8_t last_boot;
+  HAL_StatusTypeDef last_hal_status;
   uint8_t last_status;
+  uint16_t last_id;
   uint16_t last_distance_mm;
 } VL53L1X_HandleTypeDef;
 

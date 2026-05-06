@@ -4,6 +4,7 @@
 #define VL53L1X_I2C_ADDR_8BIT        (VL53L1X_I2C_ADDR_7BIT << 1)
 #define VL53L1X_I2C_TIMEOUT_MS       20U
 #define VL53L1X_BOOT_TIMEOUT_MS      120U
+#define VL53L1X_DISABLE_XSHUT_POWERDOWN 1U
 
 #define REG_GPIO_HV_MUX_CTRL         0x0030U
 #define REG_SYSTEM_INTERRUPT_CLEAR   0x0086U
@@ -76,6 +77,21 @@ static HAL_StatusTypeDef set_interrupt_active_low(VL53L1X_HandleTypeDef *h)
   return wr8(h, REG_GPIO_HV_MUX_CTRL, v);
 }
 
+static uint8_t map_range_status(uint8_t raw_status)
+{
+  static const uint8_t status_map[24] = {
+    255U, 255U, 255U, 5U, 2U, 4U, 1U, 7U,
+    3U, 0U, 255U, 255U, 9U, 13U, 255U, 255U,
+    255U, 255U, 10U, 6U, 255U, 255U, 11U, 12U
+  };
+
+  raw_status &= 0x1FU;
+  if (raw_status < (uint8_t)(sizeof(status_map) / sizeof(status_map[0]))) {
+    return status_map[raw_status];
+  }
+  return 255U;
+}
+
 HAL_StatusTypeDef VL53L1X_Attach(VL53L1X_HandleTypeDef *h,
                                  I2C_HandleTypeDef *hi2c,
                                  GPIO_TypeDef *xshut_port,
@@ -107,42 +123,60 @@ HAL_StatusTypeDef VL53L1X_PowerOnInit(VL53L1X_HandleTypeDef *h)
 
   if ((h == NULL) || (h->hi2c == NULL)) return HAL_ERROR;
 
+  h->last_error_stage = VL53L1X_STAGE_NONE;
+  h->last_boot = 0U;
+  h->last_id = 0U;
+  h->last_hal_status = HAL_OK;
+
   HAL_GPIO_WritePin(h->xshut_port, h->xshut_pin, GPIO_PIN_SET);
   HAL_Delay(2U);
 
   start_ms = HAL_GetTick();
   do {
     ret = rd8(h, REG_FIRMWARE_SYSTEM_STATUS, &boot);
+    h->last_hal_status = ret;
+    h->last_boot = boot;
     if ((ret == HAL_OK) && (boot != 0U)) break;
     HAL_Delay(2U);
   } while ((HAL_GetTick() - start_ms) < VL53L1X_BOOT_TIMEOUT_MS);
 
   if (boot == 0U) {
     h->initialized = 0U;
+    h->last_error_stage = VL53L1X_STAGE_BOOT;
+    h->last_hal_status = HAL_TIMEOUT;
     return HAL_TIMEOUT;
   }
 
   ret = VL53L1X_ReadID(h, &id);
+  h->last_hal_status = ret;
+  h->last_id = id;
   if ((ret != HAL_OK) || (id != VL53L1X_MODEL_ID_EXPECTED)) {
     h->initialized = 0U;
+    h->last_error_stage = VL53L1X_STAGE_ID;
     return (ret == HAL_OK) ? HAL_ERROR : ret;
   }
 
   ret = write_default_config(h);
+  h->last_hal_status = ret;
   if (ret != HAL_OK) {
     h->initialized = 0U;
+    h->last_error_stage = VL53L1X_STAGE_CFG;
     return ret;
   }
 
   ret = set_interrupt_active_low(h);
+  h->last_hal_status = ret;
   if (ret != HAL_OK) {
     h->initialized = 0U;
+    h->last_error_stage = VL53L1X_STAGE_INT;
     return ret;
   }
 
   ret = VL53L1X_ClearInterrupt(h);
+  h->last_hal_status = ret;
   if (ret != HAL_OK) {
     h->initialized = 0U;
+    h->last_error_stage = VL53L1X_STAGE_CLR;
     return ret;
   }
 
@@ -159,7 +193,11 @@ void VL53L1X_PowerOff(VL53L1X_HandleTypeDef *h)
     (void)VL53L1X_StopRanging(h);
   }
 
+#if (VL53L1X_DISABLE_XSHUT_POWERDOWN != 0U)
+  HAL_GPIO_WritePin(h->xshut_port, h->xshut_pin, GPIO_PIN_SET);
+#else
   HAL_GPIO_WritePin(h->xshut_port, h->xshut_pin, GPIO_PIN_RESET);
+#endif
   h->initialized = 0U;
   h->ranging = 0U;
 }
@@ -170,10 +208,20 @@ HAL_StatusTypeDef VL53L1X_StartRanging(VL53L1X_HandleTypeDef *h)
   if ((h == NULL) || (h->initialized == 0U)) return HAL_ERROR;
 
   ret = VL53L1X_ClearInterrupt(h);
-  if (ret != HAL_OK) return ret;
+  h->last_hal_status = ret;
+  if (ret != HAL_OK) {
+    h->last_error_stage = VL53L1X_STAGE_START;
+    return ret;
+  }
 
   ret = wr8(h, REG_SYSTEM_MODE_START, 0x40U);
-  if (ret == HAL_OK) h->ranging = 1U;
+  h->last_hal_status = ret;
+  if (ret == HAL_OK) {
+    h->ranging = 1U;
+    h->last_error_stage = VL53L1X_STAGE_NONE;
+  } else {
+    h->last_error_stage = VL53L1X_STAGE_START;
+  }
   return ret;
 }
 
@@ -208,16 +256,30 @@ HAL_StatusTypeDef VL53L1X_ReadAndClear(VL53L1X_HandleTypeDef *h,
   if ((h->initialized == 0U) || (h->ranging == 0U)) return HAL_ERROR;
 
   ret = rd8(h, REG_RESULT_RANGE_STATUS, &status);
-  if (ret != HAL_OK) return ret;
+  h->last_hal_status = ret;
+  if (ret != HAL_OK) {
+    h->last_error_stage = VL53L1X_STAGE_READ;
+    return ret;
+  }
+  status = map_range_status(status);
 
   ret = rd16(h, REG_RESULT_DISTANCE_MM, &dist);
-  if (ret != HAL_OK) return ret;
+  h->last_hal_status = ret;
+  if (ret != HAL_OK) {
+    h->last_error_stage = VL53L1X_STAGE_READ;
+    return ret;
+  }
 
   ret = VL53L1X_ClearInterrupt(h);
-  if (ret != HAL_OK) return ret;
+  h->last_hal_status = ret;
+  if (ret != HAL_OK) {
+    h->last_error_stage = VL53L1X_STAGE_READ;
+    return ret;
+  }
 
   h->last_status = status;
   h->last_distance_mm = dist;
+  h->last_error_stage = VL53L1X_STAGE_NONE;
   *range_status = status;
   *distance_mm = dist;
   return HAL_OK;

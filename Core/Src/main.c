@@ -21,6 +21,7 @@
 #include "vl53l1x_hal.h"
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -70,6 +71,8 @@ typedef enum {
 #define SENSOR_PERIOD_MS          400U
 #define UI_PERIOD_MS              180U
 #define RANGE_RESTART_MS          1000U
+#define RANGE_POLL_MS             120U
+#define RANGE_FORCE_ALWAYS_ON     1U
 #define RANGE_XSHUT_GPIO_Port     GPIOC
 #define RANGE_XSHUT_Pin           GPIO_PIN_13
 #define RANGE_INT_Pin             GPIO_PIN_14
@@ -113,9 +116,11 @@ static uint8_t g_selftest_boot = 1U;
 static uint8_t g_range_needed = 0U;
 static uint8_t g_range_active = 0U;
 static uint8_t g_range_ok = 0U;
+static uint8_t g_range_read_seen = 0U;
 static uint16_t g_range_mm = 0U;
 static uint8_t g_range_status = 0xFFU;
 static uint32_t g_range_retry_ms = 0U;
+static uint32_t g_range_last_poll_ms = 0U;
 static volatile uint8_t g_vl53_int_flag = 0U;
 static volatile uint8_t g_i2c1_busy = 0U;
 static int16_t enc_last = 0;
@@ -131,6 +136,7 @@ static void Update_Meter(void);
 static void Range_Task(void);
 static void Range_SetNeeded(uint8_t needed);
 static uint8_t Range_IsNeeded(void);
+static const char *Range_DebugText(void);
 static uint8_t I2C1_TryLock(void);
 static void I2C1_Unlock(void);
 static void Meter_Recalculate(void);
@@ -406,6 +412,7 @@ static void Range_Task(void)
   uint32_t now = HAL_GetTick();
 
   Range_SetNeeded(Range_IsNeeded());
+  HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
 
   if (g_range_needed == 0U) {
     return;
@@ -417,37 +424,59 @@ static void Range_Task(void)
     }
 
     if (I2C1_TryLock()) {
-      if ((VL53L1X_PowerOnInit(&hvl53) == HAL_OK) &&
-          (VL53L1X_StartRanging(&hvl53) == HAL_OK)) {
+      HAL_StatusTypeDef init_ret = VL53L1X_PowerOnInit(&hvl53);
+      HAL_StatusTypeDef start_ret = HAL_ERROR;
+      if (init_ret == HAL_OK) {
+        start_ret = VL53L1X_StartRanging(&hvl53);
+      }
+      if ((init_ret == HAL_OK) && (start_ret == HAL_OK)) {
         g_range_active = 1U;
         g_range_ok = 0U;
+        g_range_read_seen = 0U;
         g_vl53_int_flag = 0U;
+        g_range_last_poll_ms = now;
       } else {
+        if (init_ret == HAL_OK) {
+          hvl53.last_error_stage = VL53L1X_STAGE_START;
+          hvl53.last_hal_status = start_ret;
+        }
         g_range_active = 0U;
         g_range_ok = 0U;
         g_range_retry_ms = now;
+#if (RANGE_FORCE_ALWAYS_ON != 0U)
+        HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
+#else
         VL53L1X_PowerOff(&hvl53);
+#endif
       }
       I2C1_Unlock();
     }
     return;
   }
 
-  if (g_vl53_int_flag != 0U) {
+  if ((g_vl53_int_flag != 0U) ||
+      ((now - g_range_last_poll_ms) >= RANGE_POLL_MS)) {
     uint16_t distance = 0U;
     uint8_t status = 0xFFU;
 
     if (I2C1_TryLock()) {
       g_vl53_int_flag = 0U;
+      g_range_last_poll_ms = now;
       if (VL53L1X_ReadAndClear(&hvl53, &distance, &status) == HAL_OK) {
         g_range_mm = distance;
         g_range_status = status;
+        g_range_read_seen = 1U;
         g_range_ok = (status == 0U) ? 1U : 0U;
       } else {
+        hvl53.last_error_stage = VL53L1X_STAGE_READ;
         g_range_ok = 0U;
         g_range_active = 0U;
         g_range_retry_ms = now;
+#if (RANGE_FORCE_ALWAYS_ON != 0U)
+        HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
+#else
         VL53L1X_PowerOff(&hvl53);
+#endif
       }
       I2C1_Unlock();
     }
@@ -456,6 +485,10 @@ static void Range_Task(void)
 
 static void Range_SetNeeded(uint8_t needed)
 {
+#if (RANGE_FORCE_ALWAYS_ON != 0U)
+  needed = 1U;
+  HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
+#endif
   needed = (needed != 0U) ? 1U : 0U;
 
   if (needed == g_range_needed) {
@@ -465,14 +498,19 @@ static void Range_SetNeeded(uint8_t needed)
   g_range_needed = needed;
 
   if (g_range_needed == 0U) {
+#if (RANGE_FORCE_ALWAYS_ON != 0U)
+    HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_SET);
+#else
     if (I2C1_TryLock()) {
       VL53L1X_PowerOff(&hvl53);
       I2C1_Unlock();
     } else {
       HAL_GPIO_WritePin(RANGE_XSHUT_GPIO_Port, RANGE_XSHUT_Pin, GPIO_PIN_RESET);
     }
+#endif
     g_range_active = 0U;
     g_range_ok = 0U;
+    g_range_read_seen = 0U;
     g_vl53_int_flag = 0U;
   }
 }
@@ -485,6 +523,28 @@ static uint8_t Range_IsNeeded(void)
     return 1U;
   }
   return 1U;
+}
+
+static const char *Range_DebugText(void)
+{
+  switch (hvl53.last_error_stage) {
+    case VL53L1X_STAGE_BOOT:
+      return "BOOT";
+    case VL53L1X_STAGE_ID:
+      return "ID";
+    case VL53L1X_STAGE_CFG:
+      return "CFG";
+    case VL53L1X_STAGE_INT:
+      return "INT";
+    case VL53L1X_STAGE_CLR:
+      return "CLR";
+    case VL53L1X_STAGE_START:
+      return "START";
+    case VL53L1X_STAGE_READ:
+      return "READ";
+    default:
+      return "TRY";
+  }
 }
 
 static uint8_t I2C1_TryLock(void)
@@ -664,8 +724,18 @@ static void UI_DrawSelfTest(void)
 
   if (g_range_ok != 0U) {
     snprintf(line, sizeof(line), "DIST: OK %ucm", (unsigned int)(g_range_mm / 10U));
+  } else if (g_range_read_seen != 0U) {
+    snprintf(line, sizeof(line), "DIST:S%02X %ucm",
+             (unsigned int)g_range_status,
+             (unsigned int)(g_range_mm / 10U));
   } else if (g_range_active != 0U) {
     snprintf(line, sizeof(line), "DIST: WAIT");
+  } else if (hvl53.last_error_stage == VL53L1X_STAGE_ID) {
+    snprintf(line, sizeof(line), "DIST:ID %04X H%u",
+             (unsigned int)hvl53.last_id,
+             (unsigned int)hvl53.last_hal_status);
+  } else if (g_range_needed != 0U) {
+    snprintf(line, sizeof(line), "DIST: %s", Range_DebugText());
   } else {
     snprintf(line, sizeof(line), "DIST: OFF");
   }
@@ -686,10 +756,14 @@ static void UI_DrawBottomStatusBar(void)
   }
   SSD1306_DrawString(0U, 7U, line);
 
-  /* Middle: distance, unit is cm */
+  /* Middle: distance, unit is m */
   if (g_range_active != 0U) {
     if (g_range_ok != 0U) {
-      snprintf(line, sizeof(line), "D:%u", (unsigned int)(g_range_mm / 10U));
+      snprintf(line, sizeof(line), "D:%u.%02um",
+               (unsigned int)(g_range_mm / 1000U),
+               (unsigned int)((g_range_mm % 1000U) / 10U));
+    } else if (g_range_read_seen != 0U) {
+      snprintf(line, sizeof(line), "D:S%02X", (unsigned int)g_range_status);
     } else {
       snprintf(line, sizeof(line), "D:--");
     }
@@ -709,7 +783,12 @@ static void UI_DrawBottomStatusBar(void)
   } else {
     snprintf(line, sizeof(line), "EV--");
   }
-  SSD1306_DrawString(90U, 7U, line);
+  {
+    size_t ev_len = strlen(line);
+    uint16_t ev_w = (uint16_t)(ev_len * 6U);
+    uint8_t ev_x = (ev_w < SSD1306_WIDTH) ? (uint8_t)(SSD1306_WIDTH - ev_w) : 0U;
+    SSD1306_DrawString(ev_x, 7U, line);
+  }
 }
 
 static uint16_t Battery_ReadMv(void)
