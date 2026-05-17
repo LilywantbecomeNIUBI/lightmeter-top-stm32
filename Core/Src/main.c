@@ -74,8 +74,11 @@ typedef enum {
 #define RANGE_POLL_MS             120U
 #define RANGE_FORCE_ALWAYS_ON     1U
 #define DISPLAY_IIR_SHIFT         2U
+#define DISPLAY_RANGE_IIR_SHIFT   3U
 #define DISPLAY_LUX_STABLE_X10    30UL
 #define DISPLAY_RANGE_STABLE_MM   20U
+#define DISPLAY_RANGE_DEADBAND_MM 20U
+#define DISPLAY_RANGE_STEP_MM     50U
 #define RANGE_XSHUT_GPIO_Port     GPIOC
 #define RANGE_XSHUT_Pin           GPIO_PIN_13
 #define RANGE_INT_Pin             GPIO_PIN_14
@@ -149,6 +152,7 @@ static const char *Range_DebugText(void);
 static void DisplayFilter_UpdateLux(uint32_t lux_x10);
 static void DisplayFilter_UpdateRange(uint16_t range_mm);
 static uint32_t IIR_UpdateU32(uint32_t current, uint32_t target);
+static uint32_t IIR_UpdateU32Shift(uint32_t current, uint32_t target, uint8_t shift);
 static uint32_t AbsDiffU32(uint32_t a, uint32_t b);
 static uint8_t I2C1_TryLock(void);
 static void I2C1_Unlock(void);
@@ -583,14 +587,25 @@ static void DisplayFilter_UpdateLux(uint32_t lux_x10)
 
 static void DisplayFilter_UpdateRange(uint16_t range_mm)
 {
-  uint32_t filtered;
+  uint32_t current;
+  uint32_t target;
+  uint32_t diff;
 
   if (g_range_disp_valid == 0U) {
     g_range_disp_mm = range_mm;
     g_range_disp_valid = 1U;
   } else {
-    filtered = IIR_UpdateU32((uint32_t)g_range_disp_mm, (uint32_t)range_mm);
-    g_range_disp_mm = (uint16_t)filtered;
+    current = (uint32_t)g_range_disp_mm;
+    target = (uint32_t)range_mm;
+    diff = AbsDiffU32(current, target);
+
+    if (diff > DISPLAY_RANGE_DEADBAND_MM) {
+      if (diff > DISPLAY_RANGE_STEP_MM) {
+        target = (target > current) ? (current + DISPLAY_RANGE_STEP_MM)
+                                   : (current - DISPLAY_RANGE_STEP_MM);
+      }
+      g_range_disp_mm = (uint16_t)IIR_UpdateU32Shift(current, target, DISPLAY_RANGE_IIR_SHIFT);
+    }
   }
 
   g_range_disp_stable =
@@ -598,6 +613,11 @@ static void DisplayFilter_UpdateRange(uint16_t range_mm)
 }
 
 static uint32_t IIR_UpdateU32(uint32_t current, uint32_t target)
+{
+  return IIR_UpdateU32Shift(current, target, DISPLAY_IIR_SHIFT);
+}
+
+static uint32_t IIR_UpdateU32Shift(uint32_t current, uint32_t target, uint8_t shift)
 {
   uint32_t delta;
   uint32_t step;
@@ -608,13 +628,13 @@ static uint32_t IIR_UpdateU32(uint32_t current, uint32_t target)
 
   if (target > current) {
     delta = target - current;
-    step = delta >> DISPLAY_IIR_SHIFT;
+    step = delta >> shift;
     if (step == 0U) step = 1U;
     return current + step;
   }
 
   delta = current - target;
-  step = delta >> DISPLAY_IIR_SHIFT;
+  step = delta >> shift;
   if (step == 0U) step = 1U;
   return current - step;
 }
